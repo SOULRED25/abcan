@@ -1,0 +1,99 @@
+# abCAN-v2 Refined Configuration
+# Dual-Stream SE(3)-Equivariant Architecture
+
+# ─────────────────────────────────────────────
+# Project
+# ─────────────────────────────────────────────
+project:
+  name: "abCAN-v2-SE3"
+  description: "Dual-Stream SE(3)-Equivariant Architecture for Antibody-Antigen ΔΔG"
+  seed: 42
+  device: "cuda"
+
+# ─────────────────────────────────────────────
+# 1. Data & Pretraining Streams
+# ─────────────────────────────────────────────
+dataset:
+  # Base directory where the user will place all databases
+  database_dir: "database/"
+  
+  # Stream 1: SAbDab2 3D Structures
+  sabdab2:
+    dir: "database/sabdab2/"
+    pretraining_task: "masked_3d_recovery"
+    
+  # Stream 2: AbAGym Mutational Sequences
+  abagym:
+    dir: "database/abagym/"
+    
+  # Stream 3: Experimental Dataset (Full Dataset ~143MB)
+  experimental:
+    csv_path: "database/sabdab2/splits_final/abag_split.csv"
+    expected_rows: 15000
+    
+  # PDB Utilities
+  concordance:
+    modes: ["exact", "offset", "not_found"]
+    max_offset: 5
+    fallback: "skip"
+
+# ─────────────────────────────────────────────
+# 2. Dual-Stream Feature Encoders
+# ─────────────────────────────────────────────
+encoders:
+  # Structure Stream: SE(3)-Equivariant GNN
+  se3_egnn:
+    node_dim: 128
+    edge_dim: 32
+    num_layers: 4
+    aggr: "mean"
+    
+  # Sequence Stream: ESM2
+  esm2:
+    model_name: "esm2_t33_650M_UR50D"
+    embedding_dim: 1280
+    freeze: true
+    
+  # Zero-Shot LLR Prior
+  zero_shot_llr:
+    enabled: true
+
+# ─────────────────────────────────────────────
+# 3. Bi-Directional Cross-Attention Engine
+# ─────────────────────────────────────────────
+cross_attention:
+  hidden_dim: 128
+  num_heads: 8
+  dropout: 0.1
+  # Additive Attention Biases
+  biases:
+    lambda_iface: 2.0        # Bonus for interface residues
+    interface_cutoff: 5.0    # Å
+    lambda_mut: 5.0          # Bonus for mutation sites
+
+# ─────────────────────────────────────────────
+# 4. Anti-Symmetric Thermodynamic Predictor
+# ─────────────────────────────────────────────
+predictor:
+  hidden_dim: 128
+  siamese_mlp:
+    layers: [128, 64, 32]
+    activation: "gelu"
+    dropout: 0.2
+  
+  outputs:
+    - "predicted_ddg"
+    - "auxiliary_affinity_direction"
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  epochs: 100
+  batch_size: 16
+  optimizer:
+    type: "adamw"
+    lr: 1.0e-4
+  loss:
+    ddg_mse_weight: 1.0
+    aux_ce_weight: 0.5
