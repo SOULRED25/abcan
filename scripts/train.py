@@ -1,96 +1,149 @@
-"""Train on abCAN training data and evaluate once on held-out M515."""
+"""Train the active abCAN source-only ΔΔG baseline.
+
+This entry point deliberately uses only the normalized AB-Bind and SKEMPI
+records in ``database/abcan/source_candidates_unfiltered.csv``. It does not
+load SAbDab2, AbAgym, PROXiMATE, or M515. M515 remains unavailable locally,
+so this script reports a grouped held-out source-set result, not an M515 score.
+"""
+from __future__ import annotations
+
+import json
 import logging
-import random
-import sys
+import re
+from typing import Iterable
 
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
+import pandas as pd
+from joblib import dump
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import GroupShuffleSplit
 
 from config import load_config, resolve_path
-from data.dataset import AbCANDatasetSE3, collate_abcan_batch
-from models.abcan_v2_se3 import AbCANv2_SE3
-from training.loop import Trainer
+from evaluation.metrics import calculate_metrics
+from features.biochemical import get_blosum62_score, get_property_change
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+_WITH_CHAIN = re.compile(r"([A-Za-z0-9]+):([A-Z])(\d+)([A-Z])")
+_COMPACT_WITH_CHAIN = re.compile(r"([A-Za-z0-9])([A-Z])(\d+)([A-Z])")
+_WITHOUT_CHAIN = re.compile(r"([A-Z])(\d+)([A-Z])")
+_SOURCE_CODES = {"AB-Bind": 0.0, "SKEMPI 1": 1.0, "SKEMPI 2": 2.0}
 
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+
+def _mutations(value: object) -> Iterable[tuple[str, str, int, str]]:
+    """Parse common AB-Bind/SKEMPI mutation forms without inventing residues."""
+    for part in (item.strip() for item in str(value or "").upper().replace(";", ",").split(",")):
+        match = _WITH_CHAIN.fullmatch(part)
+        if match:
+            chain, wt, position, mut = match.groups()
+            yield chain, wt, int(position), mut
+            continue
+        match = _COMPACT_WITH_CHAIN.fullmatch(part)
+        if match:
+            chain, wt, position, mut = match.groups()
+            yield chain, wt, int(position), mut
+            continue
+        match = _WITHOUT_CHAIN.fullmatch(part)
+        if match:
+            wt, position, mut = match.groups()
+            yield "", wt, int(position), mut
+
+
+def _feature_row(row: pd.Series) -> dict[str, float]:
+    mutations = list(_mutations(row["mutation_cleaned"]))
+    count = len(mutations)
+    features = {
+        "source_code": _SOURCE_CODES.get(str(row["source_dataset"]), -1.0),
+        "mutation_count": float(count), "mean_position": 0.0, "mean_blosum62": 0.0,
+        "sum_abs_polarity_change": 0.0, "sum_abs_charge_change": 0.0,
+        "sum_abs_size_change": 0.0, "sum_abs_hydrophobicity_change": 0.0,
+        "alanine_fraction": 0.0, "same_residue_fraction": 0.0,
+    }
+    if not mutations:
+        return features
+    positions, blosum = [], []
+    alanine = unchanged = 0
+    for _, wt, position, mut in mutations:
+        positions.append(position)
+        blosum.append(get_blosum62_score(wt, mut))
+        features["sum_abs_polarity_change"] += abs(get_property_change(wt, mut, "polarity"))
+        features["sum_abs_charge_change"] += abs(get_property_change(wt, mut, "charge"))
+        features["sum_abs_size_change"] += abs(get_property_change(wt, mut, "size_normalized"))
+        features["sum_abs_hydrophobicity_change"] += abs(get_property_change(wt, mut, "hydrophobicity_normalized"))
+        alanine += int(mut == "A")
+        unchanged += int(wt == mut)
+    features["mean_position"] = float(np.mean(positions))
+    features["mean_blosum62"] = float(np.mean(blosum))
+    features["alanine_fraction"] = alanine / count
+    features["same_residue_fraction"] = unchanged / count
+    return features
+
+
+def _grouped_splits(frame: pd.DataFrame, seed: int, validation_fraction: float, test_fraction: float):
+    groups = frame["complex_id"].fillna("").astype(str)
+    groups = groups.where(groups.ne(""), frame["source_record_id"].astype(str))
+    first = GroupShuffleSplit(n_splits=1, test_size=test_fraction, random_state=seed)
+    train_val_index, test_index = next(first.split(frame, groups=groups))
+    train_val = frame.iloc[train_val_index]
+    second = GroupShuffleSplit(n_splits=1, test_size=validation_fraction / (1.0 - test_fraction), random_state=seed + 1)
+    train_local, validation_local = next(second.split(train_val, groups=groups.iloc[train_val_index]))
+    return train_val.iloc[train_local], train_val.iloc[validation_local], frame.iloc[test_index]
+
+
+def _score(name: str, model, frame: pd.DataFrame, feature_names: list[str]) -> tuple[dict[str, float], np.ndarray]:
+    predictions = model.predict(frame[feature_names])
+    metrics = calculate_metrics(predictions, frame["ddg_kcal_mol"].to_numpy(dtype=float))
+    result = {key: float(value) for key, value in metrics.items()}
+    result["n"] = int(len(frame))
+    logger.info("%s — RMSE %.4f kcal/mol — PCC %.4f (n=%d)", name, result["rmse"], result["pearson_r"], result["n"])
+    return result, predictions
 
 
 def main() -> None:
     config = load_config()
-    dataset_cfg = config.get("dataset", {})
-    active_benchmark = dataset_cfg.get("active_benchmark")
-    if active_benchmark != "abcan_m515":
-        raise SystemExit(
-            "This entry point is restricted to dataset.active_benchmark=abcan_m515."
-        )
-
-    benchmark_cfg = dataset_cfg.get("abcan_m515", {})
-    required_paths = {
-        "original abCAN training manifest": benchmark_cfg.get("training_manifest"),
-        "held-out M515 test manifest": benchmark_cfg.get("m515_test_manifest"),
-        "prepared abCAN feature cache": benchmark_cfg.get("feature_cache"),
-    }
-    missing = [
-        f"{description}: {resolve_path(path)}"
-        for description, path in required_paths.items()
-        if not path or not resolve_path(path).is_file()
-    ]
-    if missing:
-        logger.error(
-            "Cannot train: the original abCAN training and held-out M515 inputs "
-            "are not present. Other bundled datasets are intentionally not substituted."
-        )
-        for path_description in missing:
-            logger.error("Missing %s", path_description)
-        raise SystemExit(2)
-
-    seed_everything(config.get("project", {}).get("seed", 42))
-
-    split_names = {
-        "train": benchmark_cfg.get("train_split", "train"),
-        "validation": benchmark_cfg.get("validation_split", "validation"),
-        "test": benchmark_cfg.get("test_split", "test"),
-    }
-    datasets = {
-        name: AbCANDatasetSE3(config, split=split)
-        for name, split in split_names.items()
-    }
-
-    batch_size = config.get("training", {}).get("batch_size", 16)
-    loader_kwargs = {
-        "batch_size": batch_size,
-        "num_workers": 0,
-        "collate_fn": collate_abcan_batch,
-    }
-    train_loader = DataLoader(datasets["train"], shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(datasets["validation"], shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(datasets["test"], shuffle=False, **loader_kwargs)
-
-    logger.info(
-        "abCAN samples — train: %d, validation: %d, held-out M515 test: %d",
-        len(datasets["train"]),
-        len(datasets["validation"]),
-        len(datasets["test"]),
+    source_cfg = config.get("dataset", {}).get("abcan_sources", {})
+    manifest = resolve_path(source_cfg.get("candidate_manifest", "database/abcan/source_candidates_unfiltered.csv"))
+    if not manifest.is_file():
+        raise SystemExit(f"Cannot train: normalized abCAN source file is missing: {manifest}")
+    frame = pd.read_csv(manifest)
+    permitted = set(source_cfg.get("include_sources", _SOURCE_CODES))
+    frame["ddg_kcal_mol"] = pd.to_numeric(frame["ddg_kcal_mol"], errors="coerce")
+    frame = frame[frame["source_dataset"].isin(permitted) & frame["ddg_kcal_mol"].notna()].copy()
+    if len(frame) < 30:
+        raise SystemExit("Cannot train: fewer than 30 labeled AB-Bind/SKEMPI source records are available.")
+    feature_frame = pd.DataFrame([_feature_row(row) for _, row in frame.iterrows()], index=frame.index)
+    frame = pd.concat((frame, feature_frame), axis=1)
+    feature_names = list(feature_frame.columns)
+    seed = int(config.get("project", {}).get("seed", 42))
+    train, validation, test = _grouped_splits(frame, seed, float(source_cfg.get("validation_fraction", 0.15)), float(source_cfg.get("test_fraction", 0.15)))
+    model = HistGradientBoostingRegressor(
+        learning_rate=float(config.get("training", {}).get("learning_rate", 0.05)),
+        max_iter=int(config.get("training", {}).get("max_iterations", 300)),
+        max_leaf_nodes=int(config.get("training", {}).get("max_leaf_nodes", 31)),
+        l2_regularization=float(config.get("training", {}).get("l2_regularization", 1.0)),
+        random_state=seed,
     )
-
-    model = AbCANv2_SE3(config)
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        config=config,
-    )
-    trainer.train()
+    model.fit(train[feature_names], train["ddg_kcal_mol"])
+    logger.info("Training only on AB-Bind/SKEMPI sources: train=%d, validation=%d, test=%d", len(train), len(validation), len(test))
+    validation_metrics, _ = _score("Validation", model, validation, feature_names)
+    test_metrics, test_predictions = _score("Held-out source test", model, test, feature_names)
+    logging_cfg = config.get("logging", {})
+    checkpoint = resolve_path(logging_cfg.get("source_model", "checkpoints/abcan_source_baseline.joblib"))
+    result_path = resolve_path(logging_cfg.get("source_results", "evaluation/results/abcan_source_only.json"))
+    predictions_path = resolve_path(logging_cfg.get("source_predictions", "evaluation/results/abcan_source_only_predictions.csv"))
+    for path in (checkpoint, result_path, predictions_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    dump({"model": model, "feature_names": feature_names, "training_sources": sorted(permitted)}, checkpoint)
+    result = {
+        "experiment": "abcan_source_only_mutation_baseline", "input_manifest": str(manifest),
+        "training_sources": sorted(permitted), "split_method": "grouped by complex_id; source-only split, not M515",
+        "m515_evaluated": False, "validation": validation_metrics, "held_out_source_test": test_metrics, "model": str(checkpoint),
+    }
+    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    test.loc[:, ["source_record_id", "source_dataset", "complex_id", "mutation_cleaned", "ddg_kcal_mol"]].assign(predicted_ddg_kcal_mol=test_predictions).to_csv(predictions_path, index=False)
+    logger.info("Saved model to %s", checkpoint)
+    logger.info("Saved source-only metrics to %s", result_path)
 
 
 if __name__ == "__main__":

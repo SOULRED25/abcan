@@ -11,43 +11,20 @@ project:
   device: "auto"
 
 # ─────────────────────────────────────────────
-# 1. Data & Pretraining Streams
+# 1. Active data
 # ─────────────────────────────────────────────
 dataset:
-  # Base directory where the user will place all databases
+  # Base directory where the user will place all databases.
   database_dir: "database/"
 
-  # Active abCAN experiment. M515 is a held-out test benchmark and must never
-  # be used as training or validation data.
-  active_benchmark: "abcan_m515"
-  abcan_m515:
-    training_manifest: "database/abcan/training.csv"
-    m515_test_manifest: "database/abcan/M515.csv"
-    feature_cache: "database/abcan/abcan_training_and_m515_features.pt"
-    train_split: "train"
-    validation_split: "validation"
-    test_split: "m515_test"
-  
-  # Stream 1: SAbDab2 3D Structures
-  sabdab2:
-    dir: "database/sabdab2/"
-    pretraining_task: "masked_3d_recovery"
-    
-  # Stream 2: AbAGym Mutational Sequences
-  abagym:
-    dir: "database/abagym/"
-    
-  # Stream 3: Experimental Dataset (Full Dataset ~143MB)
-  experimental:
-    csv_path: "database/sabdab2/splits_final/abag_split_sd.csv"
-    expected_rows: 15000
-
-    
-  # PDB Utilities
-  concordance:
-    modes: ["exact", "offset", "not_found"]
-    max_offset: 5
-    fallback: "skip"
+  # The only active training source. SAbDab2 and AbAgym stay in database/
+  # for future work but are never read by scripts/train.py.
+  active_benchmark: "abcan_source_only"
+  abcan_sources:
+    candidate_manifest: "database/abcan/source_candidates_unfiltered.csv"
+    include_sources: ["AB-Bind", "SKEMPI 1", "SKEMPI 2"]
+    validation_fraction: 0.15
+    test_fraction: 0.15
 
 # ─────────────────────────────────────────────
 # 2. Dual-Stream Feature Encoders
@@ -101,22 +78,12 @@ predictor:
 # Training
 # ─────────────────────────────────────────────
 training:
-  epochs: 100
-  batch_size: 16
-  optimizer:
-    type: "adamw"
-    lr: 1.0e-4
-  loss:
-    components:
-      mse: 1.0
-      weighted_mse: 0.0
-      cosine_hinge: 0.0
-      ranking: 0.0
-      aux_bce: 0.0
-  early_stopping:
-    patience: 20
-    min_delta: 0.001
+  learning_rate: 0.05
+  max_iterations: 300
+  max_leaf_nodes: 31
+  l2_regularization: 1.0
 
 logging:
-  best_checkpoint: "checkpoints/abcan_m515_best.pt"
-  results_path: "evaluation/results/abcan_m515.json"
+  source_model: "checkpoints/abcan_source_baseline.joblib"
+  source_results: "evaluation/results/abcan_source_only.json"
+  source_predictions: "evaluation/results/abcan_source_only_predictions.csv"
