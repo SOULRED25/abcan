@@ -78,7 +78,7 @@ class AbCANv2_SE3(nn.Module):
         mutation_mask: torch.Tensor,
         zero_shot_llr: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the full Dual-Stream SE(3) architecture.
         
@@ -97,6 +97,8 @@ class AbCANv2_SE3(nn.Module):
         Returns:
             pred_ddg: (B, 1)
             aux_logits: (B, 1)
+            e_wt: (B, 1)
+            e_mut: (B, 1)
         """
         B, N, _ = seq_wt.shape
         
@@ -131,12 +133,13 @@ class AbCANv2_SE3(nn.Module):
             padding_mask=padding_mask
         )
         
-        # 4. Anti-Symmetric Thermodynamic Predictor
-        pred_ddg, aux_logits = self.predictor(
+        # 4. Anti-Symmetric Thermodynamic Predictor with Shared Energy State Decomposition
+        pred_ddg, aux_logits, e_wt, e_mut = self.predictor(
             h_fused_wt=h_fused_wt,
             h_fused_mut=h_fused_mut,
             mutation_mask=mutation_mask,
             zero_shot_llr=zero_shot_llr
         )
         
-        return pred_ddg, aux_logits
+        return pred_ddg, aux_logits, e_wt, e_mut
+

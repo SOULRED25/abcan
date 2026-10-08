@@ -1,131 +1,175 @@
 """
-abCAN-v2 (SE3 Dual-Stream) — Dataset Loaders
+Dataset for abCAN training and the held-out M515 benchmark.
 
-Parses the experimental CSV dataset (e.g., SAbDab2 / AbAGym variants)
-and prepares the structure/sequence PyTorch Geometric data objects.
+The cache contains real, precomputed model inputs. This loader deliberately
+rejects the old synthetic examples so they cannot produce misleading scores.
 """
+from pathlib import Path
+from typing import Any, Dict, List
 
-import os
 import torch
-import pandas as pd
-from typing import Dict, Any, List, Optional
 from torch.utils.data import Dataset
-import logging
 
-logger = logging.getLogger(__name__)
+from config import resolve_path
+
+_CACHE_BY_PATH: Dict[Path, List[Dict[str, Any]]] = {}
+_REQUIRED_FIELDS = {
+    "split",
+    "struct_h",
+    "struct_x",
+    "struct_edge_index",
+    "struct_edge_attr",
+    "seq_wt",
+    "seq_mut",
+    "zero_shot_llr",
+    "interface_mask",
+    "mutation_mask",
+    "ddg",
+}
+
+
+def _load_feature_cache(path: Path) -> List[Dict[str, Any]]:
+    if path not in _CACHE_BY_PATH:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"abCAN M515 feature cache not found: {path}. "
+                "The original M515 dataset and real feature cache are required; "
+                "synthetic examples are disabled."
+            )
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(loaded, dict):
+            loaded = loaded.get("samples")
+        if not isinstance(loaded, list):
+            raise ValueError("M515 feature cache must be a list of sample dictionaries.")
+        for index, sample in enumerate(loaded):
+            if not isinstance(sample, dict):
+                raise ValueError(f"M515 cache sample {index} is not a dictionary.")
+            missing = _REQUIRED_FIELDS - set(sample)
+            if missing:
+                raise ValueError(
+                    f"M515 cache sample {index} is missing fields: {sorted(missing)}"
+                )
+        _CACHE_BY_PATH[path] = loaded
+    return _CACHE_BY_PATH[path]
+
 
 class AbCANDatasetSE3(Dataset):
+    """Selects train, validation, or the held-out m515_test split.
+
+    M515 is reserved for final scoring and must not be used for training,
+    checkpoint selection, or hyperparameter tuning.
     """
-    Unified dataset loader for the Dual-Stream SE(3) Architecture.
-    
-    Expects a CSV with columns containing PDB IDs and Mutation Info.
-    Loads structural data from SAbDab2 PDB files and sequence data from AbAGym.
-    """
-    
+
     def __init__(self, config: Dict[str, Any], split: str = "train"):
-        """
-        Args:
-            config: The loaded YAML configuration dictionary.
-            split: 'train', 'val', or 'test'.
-        """
-        self.config = config
+        dataset_cfg = config.get("dataset", {})
+        active = dataset_cfg.get("active_benchmark")
+        if active != "abcan_m515":
+            raise ValueError(
+                f"This training path only supports abcan_m515; configured active "
+                f"benchmark is {active!r}."
+            )
+
+        benchmark_cfg = dataset_cfg.get("abcan_m515", {})
+        cache_value = benchmark_cfg.get("feature_cache")
+        if not cache_value:
+            raise ValueError("dataset.abcan_m515.feature_cache is not configured.")
+
         self.split = split
-        
-        db_cfg = config.get("dataset", {})
-        self.sabdab_dir = db_cfg.get("sabdab2", {}).get("dir", "database/sabdab2/")
-        self.abagym_dir = db_cfg.get("abagym", {}).get("dir", "database/abagym/")
-        self.csv_path = db_cfg.get("experimental", {}).get("csv_path", "database/sabdab2/splits_final/abag_split_sd.csv")
-        
-        self.data = self._load_and_filter_csv()
-        
-    def _load_and_filter_csv(self) -> pd.DataFrame:
-        """Loads the CSV and filters based on split (using ab_ag_split or similar column)."""
-        if not os.path.exists(self.csv_path):
-            logger.warning(f"CSV not found at {self.csv_path}. Creating an empty dataset.")
-            return pd.DataFrame()
-            
-        df = pd.read_csv(self.csv_path)
-        
-        # SAbDab2 AbAGym splits usually have a column denoting the split, e.g., 'ab_ag_split'
-        if 'ab_ag_split' in df.columns:
-            df = df[df['ab_ag_split'] == self.split]
-            logger.info(f"Loaded {len(df)} samples for split '{self.split}'.")
-        else:
-            logger.warning("No 'ab_ag_split' column found. Loading entire dataset.")
-            
-        return df.reset_index(drop=True)
+        self.cache_path = resolve_path(cache_value).resolve()
+        all_samples = _load_feature_cache(self.cache_path)
+        self.data = [
+            sample for sample in all_samples
+            if str(sample["split"]).lower() == split.lower()
+        ]
+        if not self.data:
+            raise ValueError(
+                f"No abCAN M515 samples found for split {split!r} in {self.cache_path}."
+            )
+        self._validate_samples()
+
+    def _validate_samples(self) -> None:
+        for index, sample in enumerate(self.data):
+            n_nodes = sample["struct_h"].shape[0]
+            if sample["struct_x"].shape != (n_nodes, 3):
+                raise ValueError(f"M515 sample {index}: struct_x must have shape (N, 3).")
+            if sample["seq_wt"].shape[0] != n_nodes or sample["seq_mut"].shape[0] != n_nodes:
+                raise ValueError(
+                    f"M515 sample {index}: structure and sequence residue counts differ."
+                )
+            if sample["interface_mask"].numel() != n_nodes:
+                raise ValueError(f"M515 sample {index}: invalid interface_mask length.")
+            if sample["mutation_mask"].numel() != n_nodes:
+                raise ValueError(f"M515 sample {index}: invalid mutation_mask length.")
+            if sample["struct_edge_index"].ndim != 2 or sample["struct_edge_index"].shape[0] != 2:
+                raise ValueError(
+                    f"M515 sample {index}: struct_edge_index must have shape (2, E)."
+                )
+            if sample["struct_edge_attr"].shape[0] != sample["struct_edge_index"].shape[1]:
+                raise ValueError(
+                    f"M515 sample {index}: edge indices and edge features differ in length."
+                )
 
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Retrieves a single data instance for the SE(3) model.
-        Returns a dictionary containing the necessary tensors.
-        """
-        row = self.data.iloc[idx]
-        
-        # ─────────────────────────────────────────────
-        # Note: In a full pipeline, we would load the PDB, construct a graph, 
-        # extract ESM2 embeddings, and compute masks here using `data.pdb_utils`.
-        # For brevity in this architectural scaffolding, we return mock tensors 
-        # matching the expected dimensions for `abcan_v2_se3.py`.
-        # ─────────────────────────────────────────────
-        
-        N_nodes = 50  # Simulated protein length (e.g., interface residues)
-        
-        # 1. Structure Stream (SE3-EGNN inputs)
-        # Node features (e.g., one-hot amino acid, scalar biochemical properties)
-        struct_h = torch.randn(N_nodes, 32)
-        
-        # 3D Coordinates (essential for EGNN)
-        struct_x = torch.randn(N_nodes, 3) 
-        
-        # Graph connectivity (fully connected or k-NN)
-        # For simulation, just random edges
-        E = 100
-        struct_edge_index = torch.randint(0, N_nodes, (2, E))
-        
-        # Edge attributes (e.g., distance encoding)
-        struct_edge_attr = torch.randn(E, 1)
-        
-        # 2. Sequence Stream (ESM2 inputs)
-        # Precomputed ESM2 embeddings for WT and Mutant (B, N, 1280)
-        seq_wt = torch.randn(N_nodes, 1280)
-        seq_mut = torch.randn(N_nodes, 1280)
-        
-        # Zero-Shot LLR Prior from ESM2
-        # E.g., log p(mut) - log p(wt)
-        zero_shot_llr = torch.randn(1)
-        
-        # 3. Masks
-        # Interface mask (True if distance <= 5.0A)
-        interface_mask = torch.rand(N_nodes) > 0.8
-        
-        # Mutation mask (True at the mutated residue index)
-        mutation_mask = torch.zeros(N_nodes, dtype=torch.bool)
-        mutation_mask[0] = True  # Mock mutation at index 0
-        
-        # Padding mask (True for valid residues)
-        padding_mask = torch.ones(N_nodes, dtype=torch.bool)
-        
-        # Targets
-        # Mock ddG
-        ddg = torch.tensor([0.5], dtype=torch.float32)
-        # Mock class (1 for stabilizing, 0 for destabilizing)
-        aux_class = torch.tensor([1.0], dtype=torch.float32)
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        sample = dict(self.data[index])
+        sample.setdefault(
+            "padding_mask",
+            torch.ones(sample["struct_h"].shape[0], dtype=torch.bool),
+        )
+        sample.setdefault("sample_weight", torch.tensor(1.0, dtype=torch.float32))
+        return sample
 
-        return {
-            "struct_h": struct_h,
-            "struct_x": struct_x,
-            "struct_edge_index": struct_edge_index,
-            "struct_edge_attr": struct_edge_attr,
-            "seq_wt": seq_wt,
-            "seq_mut": seq_mut,
-            "interface_mask": interface_mask,
-            "mutation_mask": mutation_mask,
-            "zero_shot_llr": zero_shot_llr,
-            "padding_mask": padding_mask,
-            "ddg": ddg,
-            "aux_class": aux_class
-        }
+
+def collate_abcan_batch(samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """Pads residue tensors and offsets graph edges for a mixed-size batch."""
+    if not samples:
+        raise ValueError("Cannot collate an empty abCAN batch.")
+
+    max_nodes = max(sample["struct_h"].shape[0] for sample in samples)
+    batched: Dict[str, List[torch.Tensor]] = {
+        key: [] for key in (
+            "struct_h", "struct_x", "seq_wt", "seq_mut",
+            "interface_mask", "mutation_mask", "padding_mask",
+        )
+    }
+    edge_indices = []
+    edge_attrs = []
+
+    for graph_index, sample in enumerate(samples):
+        n_nodes = sample["struct_h"].shape[0]
+        pad_nodes = max_nodes - n_nodes
+
+        for key in ("struct_h", "struct_x", "seq_wt", "seq_mut"):
+            value = sample[key]
+            padding = value.new_zeros((pad_nodes, *value.shape[1:]))
+            batched[key].append(torch.cat((value, padding), dim=0))
+
+        for key in ("interface_mask", "mutation_mask"):
+            value = sample[key].reshape(-1).bool()
+            batched[key].append(torch.cat((value, value.new_zeros(pad_nodes)), dim=0))
+
+        valid_mask = sample["padding_mask"].reshape(-1).bool()
+        batched["padding_mask"].append(
+            torch.cat((valid_mask, valid_mask.new_zeros(pad_nodes)), dim=0)
+        )
+
+        edge_indices.append(sample["struct_edge_index"].long() + graph_index * max_nodes)
+        edge_attrs.append(sample["struct_edge_attr"])
+
+    result = {key: torch.stack(values, dim=0) for key, values in batched.items()}
+    result["struct_h"] = result["struct_h"].reshape(-1, result["struct_h"].shape[-1])
+    result["struct_x"] = result["struct_x"].reshape(-1, 3)
+    result["struct_edge_index"] = torch.cat(edge_indices, dim=1)
+    result["struct_edge_attr"] = torch.cat(edge_attrs, dim=0)
+    result["zero_shot_llr"] = torch.stack(
+        [sample["zero_shot_llr"].reshape(1) for sample in samples], dim=0
+    )
+    result["ddg"] = torch.stack(
+        [sample["ddg"].reshape(1).float() for sample in samples], dim=0
+    )
+    result["sample_weight"] = torch.stack(
+        [sample["sample_weight"].reshape(1).float() for sample in samples], dim=0
+    )
+    return result

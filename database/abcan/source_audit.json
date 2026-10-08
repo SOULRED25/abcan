@@ -1,0 +1,44 @@
+{
+  "status": "candidate_sources_normalized_not_train_ready",
+  "candidate_file": "database\\abcan\\source_candidates_unfiltered.csv",
+  "candidate_records": 8175,
+  "split_assignments": "none; this is not a training or test manifest",
+  "deduplication": "no additional deduplication; the workbook Processed Data sheet already removes 11 exact duplicates, with raw rows retained in its Raw Data sheet",
+  "sources": [
+    {
+      "name": "AB-Bind",
+      "file": "database\\AB-Bind_experimental_data.csv",
+      "sha256": "078ab9b5c64459d5aa2e39cfdfbabdedcd946fa6bccfb49d81f59df2e175e29f",
+      "records": 1101,
+      "unique_pdb_ids": 32,
+      "records_with_ddg": 1101
+    },
+    {
+      "name": "SKEMPI processed workbook",
+      "file": "database\\SKEMPI_Processed_Dataset.xlsx",
+      "sha256": "1f70cc1dbbc0e6dff1760299221ac4e02fc865a799ea49810eaf8128721cad8c",
+      "sheet": "Processed Data",
+      "records": 7074,
+      "records_by_version": {
+        "2": 4056,
+        "1": 3018
+      },
+      "cached_ddg_values_verified": 6424,
+      "ddg_values_recomputed_from_documented_formula": 359,
+      "records_with_ddg_after_recalculation": 6783
+    }
+  ],
+  "skempi_v2_csv": "present but not merged because it overlaps the SKEMPI v1+v2 workbook source",
+  "missing_requirements": [
+    "PROXiMATE source table",
+    "M515 held-out labels/manifest",
+    "abS1131 constituent data",
+    "abM1707 constituent data"
+  ],
+  "remaining_preparation": [
+    "Identify the paper's antibody-antigen rows and M515 membership.",
+    "Apply CATH family and 80% sequence-identity exclusion against M515.",
+    "Use official train/validation membership; keep M515 held out.",
+    "Build features using the original abCAN representation."
+  ]
+}

@@ -53,13 +53,48 @@ class SiamesePredictionMLP(nn.Module):
         return pred_ddg, aux_logits
 
 
+class SharedEnergyEncoder(nn.Module):
+    """
+    Shared Energy Encoder predicting absolute thermodynamic state energy E(state).
+    Guarantees path independence and strict thermodynamic anti-symmetry:
+    DeltaDeltaG = E(Mut) - E(WT) + alpha * DeltaLR
+    """
+    def __init__(self, hidden_dim: int, mlp_layers: List[int] = [128, 64, 32], dropout: float = 0.2):
+        super().__init__()
+        layers = []
+        curr_dim = hidden_dim
+        for h_dim in mlp_layers:
+            layers.append(nn.Linear(curr_dim, h_dim))
+            layers.append(nn.LayerNorm(h_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+            curr_dim = h_dim
+        self.energy_mlp = nn.Sequential(*layers)
+        self.energy_head = nn.Linear(curr_dim, 1)
+        
+    def forward(self, h_fused: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Computes scalar state energy E for a given state representation.
+        """
+        B, N, D = h_fused.shape
+        pooled = torch.zeros(B, D, device=h_fused.device)
+        for i in range(B):
+            idx = torch.where(mask[i])[0]
+            if len(idx) > 0:
+                pooled[i] = h_fused[i, idx].mean(dim=0)
+            else:
+                pooled[i] = h_fused[i].mean(dim=0)
+                
+        feat = self.energy_mlp(pooled)
+        energy = self.energy_head(feat)
+        return energy, feat
+
+
 class AntiSymmetricPredictor(nn.Module):
     """
-    Anti-Symmetric Thermodynamic Predictor.
-    
-    1. Computes difference: Mut_fused - WT_fused
-    2. Injects Zero-Shot ΔLLR prior.
-    3. Feeds into Siamese MLP.
+    Anti-Symmetric Multi-Task Predictor based on Shared Energy State Decomposition.
+    E(WT), E(Mut) -> DeltaDeltaG = E(Mut) - E(WT) + alpha * DeltaLR
+    Also predicts auxiliary affinity gain/loss direction and pairwise ranking.
     """
     def __init__(
         self,
@@ -68,16 +103,16 @@ class AntiSymmetricPredictor(nn.Module):
         dropout: float = 0.2
     ):
         super().__init__()
-        
-        # Aggregation mechanism for the sequence/structure length. 
-        # Mean pooling over mutated residues is common before the final MLP.
-        
-        # Input dim = hidden_dim (from difference vector) + 1 (for ΔLLR scalar prior)
-        self.siamese_mlp = SiamesePredictionMLP(
-            input_dim=hidden_dim + 1,
-            hidden_layers=mlp_layers,
+        self.shared_energy_encoder = SharedEnergyEncoder(
+            hidden_dim=hidden_dim,
+            mlp_layers=mlp_layers,
             dropout=dropout
         )
+        # Learnable scaling coefficient for zero-shot DeltaLR
+        self.alpha_lr = nn.Parameter(torch.tensor(0.1))
+        
+        # Auxiliary Head: Affinity Direction Logits (Gain vs Loss)
+        self.auxiliary_direction_head = nn.Linear(mlp_layers[-1], 1)
         
     def forward(
         self,
@@ -85,39 +120,29 @@ class AntiSymmetricPredictor(nn.Module):
         h_fused_mut: torch.Tensor,
         mutation_mask: torch.Tensor,
         zero_shot_llr: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            h_fused_wt: (B, N, D)
-            h_fused_mut: (B, N, D)
-            mutation_mask: (B, N) boolean mask.
-            zero_shot_llr: (B, 1) external prior computed via ESM2 log-likelihoods.
+            h_fused_wt: (B, N, D) WT fused representations
+            h_fused_mut: (B, N, D) Mutant fused representations
+            mutation_mask: (B, N) boolean mask
+            zero_shot_llr: (B, 1) ESM2 Zero-Shot LLR Prior
             
         Returns:
-            pred_ddg: (B, 1)
-            aux_logits: (B, 1)
+            pred_ddg: (B, 1) Predicted ΔΔG
+            aux_logits: (B, 1) Affinity direction classification logits
+            e_wt: (B, 1) WT absolute energy
+            e_mut: (B, 1) Mutant absolute energy
         """
-        B, N, D = h_fused_wt.shape
+        e_wt, feat_wt = self.shared_energy_encoder(h_fused_wt, mutation_mask)
+        e_mut, feat_mut = self.shared_energy_encoder(h_fused_mut, mutation_mask)
         
-        # Paired Difference Vector
-        h_diff = h_fused_mut - h_fused_wt  # Strictly Anti-Symmetric (Mut - WT)
+        # Exact Thermodynamic Energy Difference + Sequence LLR Contribution
+        pred_ddg = (e_mut - e_wt) + self.alpha_lr * zero_shot_llr
         
-        # Pool features at the mutation site
-        # To handle multiple mutations, we mean-pool across True indices in the mask
-        pooled_diff = torch.zeros(B, D, device=h_diff.device)
+        # Feature difference for auxiliary direction classification
+        feat_diff = feat_mut - feat_wt
+        aux_logits = self.auxiliary_direction_head(feat_diff)
         
-        for i in range(B):
-            mut_idx = torch.where(mutation_mask[i])[0]
-            if len(mut_idx) > 0:
-                pooled_diff[i] = h_diff[i, mut_idx].mean(dim=0)
-            else:
-                pooled_diff[i] = h_diff[i].mean(dim=0)
-                
-        # Direct ΔLLR Prior Injection
-        # Concatenate the scalar ΔLLR directly into the final feature vector
-        injected_features = torch.cat([pooled_diff, zero_shot_llr], dim=-1)  # (B, D + 1)
-        
-        # Predict
-        pred_ddg, aux_logits = self.siamese_mlp(injected_features)
-        
-        return pred_ddg, aux_logits
+        return pred_ddg, aux_logits, e_wt, e_mut
+

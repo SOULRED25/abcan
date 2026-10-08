@@ -8,7 +8,7 @@ project:
   name: "abCAN-v2-SE3"
   description: "Dual-Stream SE(3)-Equivariant Architecture for Antibody-Antigen ΔΔG"
   seed: 42
-  device: "cuda"
+  device: "auto"
 
 # ─────────────────────────────────────────────
 # 1. Data & Pretraining Streams
@@ -16,6 +16,17 @@ project:
 dataset:
   # Base directory where the user will place all databases
   database_dir: "database/"
+
+  # Active abCAN experiment. M515 is a held-out test benchmark and must never
+  # be used as training or validation data.
+  active_benchmark: "abcan_m515"
+  abcan_m515:
+    training_manifest: "database/abcan/training.csv"
+    m515_test_manifest: "database/abcan/M515.csv"
+    feature_cache: "database/abcan/abcan_training_and_m515_features.pt"
+    train_split: "train"
+    validation_split: "validation"
+    test_split: "m515_test"
   
   # Stream 1: SAbDab2 3D Structures
   sabdab2:
@@ -28,8 +39,9 @@ dataset:
     
   # Stream 3: Experimental Dataset (Full Dataset ~143MB)
   experimental:
-    csv_path: "database/sabdab2/splits_final/abag_split.csv"
+    csv_path: "database/sabdab2/splits_final/abag_split_sd.csv"
     expected_rows: 15000
+
     
   # PDB Utilities
   concordance:
@@ -95,5 +107,16 @@ training:
     type: "adamw"
     lr: 1.0e-4
   loss:
-    ddg_mse_weight: 1.0
-    aux_ce_weight: 0.5
+    components:
+      mse: 1.0
+      weighted_mse: 0.0
+      cosine_hinge: 0.0
+      ranking: 0.0
+      aux_bce: 0.0
+  early_stopping:
+    patience: 20
+    min_delta: 0.001
+
+logging:
+  best_checkpoint: "checkpoints/abcan_m515_best.pt"
+  results_path: "evaluation/results/abcan_m515.json"

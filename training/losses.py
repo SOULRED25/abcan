@@ -8,7 +8,7 @@ Combined loss from the architecture diagram:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional
 
 
 class CensoredHingeLoss(nn.Module):
@@ -40,63 +40,91 @@ class CensoredHingeLoss(nn.Module):
         return loss if isinstance(loss, torch.Tensor) else torch.tensor(0.0, device=pred.device)
 
 
-class CombinedLoss(nn.Module):
+class PairwiseAffinityRankingLoss(nn.Module):
     """
-    Combined Loss for abCAN-v2 training.
-    
-    Includes:
-    1. Standard MSE
-    2. Weighted MSE (replicate experimental noise weighting)
-    3. Censored Hinge Loss for assay saturation
+    Auxiliary Pairwise Affinity Ranking Loss.
+    Penalizes incorrect ranking order of mutant pairs within the same batch/complex.
+    """
+    def __init__(self, margin: float = 0.1):
+        super().__init__()
+        self.margin = margin
+        
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = pred.view(-1)
+        target = target.view(-1)
+        
+        # Pairwise differences
+        diff_target = target.unsqueeze(0) - target.unsqueeze(1) # (N, N)
+        diff_pred = pred.unsqueeze(0) - pred.unsqueeze(1)       # (N, N)
+        
+        # We look at pairs where target_i > target_j
+        mask = diff_target > 0
+        if not mask.any():
+            return torch.tensor(0.0, device=pred.device)
+            
+        # Hinge loss: max(0, margin - (pred_i - pred_j))
+        loss = F.relu(self.margin - diff_pred[mask])
+        return loss.mean()
+
+
+class MultiTaskLoss(nn.Module):
+    """
+    Multi-Task Loss corresponding to Stage 4 (Multi-Task Training):
+    1. Primary ΔΔG Regression (MSE + Weighted MSE + Censored Hinge)
+    2. Auxiliary Pairwise Affinity Ranking Loss
+    3. Auxiliary Affinity Direction Binary Classification Loss
     """
     def __init__(
         self,
         mse_weight: float = 1.0,
         weighted_mse_weight: float = 0.5,
         hinge_weight: float = 0.3,
+        ranking_weight: float = 0.4,
+        aux_bce_weight: float = 0.3,
         saturation_margin: float = 8.0,
     ):
         super().__init__()
         self.mse_weight = mse_weight
         self.weighted_mse_weight = weighted_mse_weight
         self.hinge_weight = hinge_weight
+        self.ranking_weight = ranking_weight
+        self.aux_bce_weight = aux_bce_weight
         
         self.hinge = CensoredHingeLoss(margin=saturation_margin)
+        self.ranking = PairwiseAffinityRankingLoss(margin=0.1)
+        self.bce = nn.BCEWithLogitsLoss()
         
     def forward(
         self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
+        pred_ddg: torch.Tensor,
+        target_ddg: torch.Tensor,
         sample_weights: torch.Tensor,
+        aux_logits: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            pred: (B, 1) or (B,) predicted ΔΔG.
-            target: (B, 1) or (B,) true ΔΔG.
-            sample_weights: (B,) experimental certainty weights.
-            
-        Returns:
-            Dict containing 'loss' (total) and individual components.
-        """
-        pred = pred.view(-1)
-        target = target.view(-1)
-        sample_weights = sample_weights.view(-1)
+        pred = pred_ddg.view(-1)
+        target = target_ddg.view(-1)
+        weights = sample_weights.view(-1)
         
-        # 1. Standard MSE
+        # 1. Primary Regression Losses
         mse_loss = F.mse_loss(pred, target)
-        
-        # 2. Weighted MSE (incorporates experimental variance/replicates)
-        # Weights are assumed to be normalized.
-        weighted_mse = torch.mean(sample_weights * (pred - target).pow(2))
-        
-        # 3. Censored Hinge
+        weighted_mse = torch.mean(weights * (pred - target).pow(2))
         hinge_loss = self.hinge(pred, target)
         
-        # Total
+        # 2. Auxiliary Pairwise Ranking Loss
+        ranking_loss = self.ranking(pred, target)
+        
+        # 3. Auxiliary Binary Direction (Gain=1 if target > 0 else 0)
+        aux_bce_loss = torch.tensor(0.0, device=pred.device)
+        if aux_logits is not None:
+            direction_target = (target > 0).float().view(-1, 1)
+            aux_bce_loss = self.bce(aux_logits, direction_target)
+            
         total_loss = (
             self.mse_weight * mse_loss +
             self.weighted_mse_weight * weighted_mse +
-            self.hinge_weight * hinge_loss
+            self.hinge_weight * hinge_loss +
+            self.ranking_weight * ranking_loss +
+            self.aux_bce_weight * aux_bce_loss
         )
         
         return {
@@ -104,4 +132,7 @@ class CombinedLoss(nn.Module):
             "mse": mse_loss,
             "weighted_mse": weighted_mse,
             "hinge": hinge_loss,
+            "ranking": ranking_loss,
+            "aux_bce": aux_bce_loss,
         }
+
