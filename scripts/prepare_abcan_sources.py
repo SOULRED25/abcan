@@ -54,10 +54,22 @@ def main() -> None:
         if not path.is_file():
             raise FileNotFoundError(path)
 
+    # If AB_PATH is a Git LFS pointer file, pull the real data
+    try:
+        with AB_PATH.open("r", encoding="latin1", errors="ignore") as f:
+            if f.readline().startswith("version https://git-lfs.github.com/spec/v1"):
+                import subprocess
+                subprocess.run(["git", "lfs", "pull"], cwd=str(ROOT), check=False)
+    except Exception:
+        pass
+
     ab = pd.read_csv(AB_PATH, encoding="latin1", dtype=str, keep_default_na=False)
     ab_required = {"#PDB", "Partners(A_B)", "Protein-1", "Protein-2", "Mutation", "ddG(kcal/mol)"}
     if ab_required - set(ab.columns):
-        raise ValueError(f"AB-Bind missing columns: {sorted(ab_required - set(ab.columns))}")
+        raise ValueError(
+            f"AB-Bind missing columns: {sorted(ab_required - set(ab.columns))}. "
+            "If this file is a Git LFS pointer, run `git lfs pull` to download the dataset."
+        )
 
     candidates = []
     for i, r in ab.iterrows():
