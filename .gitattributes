@@ -1,4 +1,6 @@
 *.tar.gz filter=lfs diff=lfs merge=lfs -text
 *.gz filter=lfs diff=lfs merge=lfs -text
-*.csv filter=lfs diff=lfs merge=lfs -text
+database/sabdab2/** filter=lfs diff=lfs merge=lfs -text
+database/AB-Bind_experimental_data.csv !filter !diff !merge text
+database/abcan/** !filter !diff !merge text
 *.pdb filter=lfs diff=lfs merge=lfs -text
