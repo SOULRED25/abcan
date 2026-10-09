@@ -56,12 +56,20 @@ def main() -> None:
 
     # If AB_PATH is a Git LFS pointer file, pull the real data
     try:
+        is_lfs = False
         with AB_PATH.open("r", encoding="latin1", errors="ignore") as f:
-            if f.readline().startswith("version https://git-lfs.github.com/spec/v1"):
-                import subprocess
-                subprocess.run(["git", "lfs", "pull"], cwd=str(ROOT), check=False)
-    except Exception:
-        pass
+            is_lfs = f.readline().startswith("version https://git-lfs.github.com/spec/v1")
+        if is_lfs:
+            import subprocess
+            print("Detected Git LFS pointer for AB-Bind, pulling actual data...")
+            subprocess.run(["git", "lfs", "install"], cwd=str(ROOT), check=False)
+            res = subprocess.run(["git", "lfs", "pull"], cwd=str(ROOT), capture_output=True, text=True, check=False)
+            if res.stdout:
+                print(res.stdout)
+            if res.stderr:
+                print(res.stderr)
+    except Exception as exc:
+        print("Git LFS auto-pull encountered:", exc)
 
     ab = pd.read_csv(AB_PATH, encoding="latin1", dtype=str, keep_default_na=False)
     ab_required = {"#PDB", "Partners(A_B)", "Protein-1", "Protein-2", "Mutation", "ddG(kcal/mol)"}

@@ -104,20 +104,25 @@ def main() -> None:
     config = load_config()
     source_cfg = config.get("dataset", {}).get("abcan_sources", {})
     manifest = resolve_path(source_cfg.get("candidate_manifest", "database/abcan/source_candidates_unfiltered.csv"))
-    if not manifest.is_file():
-        raise SystemExit(f"Cannot train: normalized abCAN source file is missing: {manifest}")
-    try:
-        with manifest.open("r", encoding="utf-8", errors="ignore") as f:
-            if f.readline().startswith("version https://git-lfs.github.com/spec/v1"):
-                import subprocess
-                subprocess.run(["git", "lfs", "pull"], check=False)
-    except Exception:
-        pass
+    def _is_lfs(p):
+        try:
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
+                return f.readline().startswith("version https://git-lfs.github.com/spec/v1")
+        except Exception:
+            return False
+
+    if not manifest.is_file() or _is_lfs(manifest):
+        logger.info("Manifest missing or Git LFS pointer; running prepare_abcan_sources...")
+        from scripts.prepare_abcan_sources import main as prepare_main
+        prepare_main()
+
     frame = pd.read_csv(manifest)
     if "ddg_kcal_mol" not in frame.columns:
-        raise ValueError(
-            f"Expected 'ddg_kcal_mol' in {manifest}. If this is a Git LFS pointer, run `git lfs pull`."
-        )
+        logger.info("Manifest missing 'ddg_kcal_mol'; regenerating via prepare_abcan_sources...")
+        from scripts.prepare_abcan_sources import main as prepare_main
+        prepare_main()
+        frame = pd.read_csv(manifest)
+
     permitted = set(source_cfg.get("include_sources", _SOURCE_CODES))
     frame["ddg_kcal_mol"] = pd.to_numeric(frame["ddg_kcal_mol"], errors="coerce")
     frame = frame[frame["source_dataset"].isin(permitted) & frame["ddg_kcal_mol"].notna()].copy()
