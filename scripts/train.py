@@ -113,6 +113,9 @@ def main() -> None:
     if len(frame) < 30:
         raise SystemExit("Cannot train: fewer than 30 labeled AB-Bind/SKEMPI source records are available.")
     feature_frame = pd.DataFrame([_feature_row(row) for _, row in frame.iterrows()], index=frame.index)
+    overlap = set(frame.columns) & set(feature_frame.columns)
+    if overlap:
+        frame = frame.drop(columns=list(overlap))
     frame = pd.concat((frame, feature_frame), axis=1)
     feature_names = list(feature_frame.columns)
     seed = int(config.get("project", {}).get("seed", 42))
